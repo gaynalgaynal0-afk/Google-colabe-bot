@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: channel-faq-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python channel_faq_bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
