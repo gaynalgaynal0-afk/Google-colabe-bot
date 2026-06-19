@@ -126,17 +126,6 @@ def main():
 
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-    # Validate Gemini API key works at startup
-    try:
-        test = gemini_client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents="ping",
-        )
-        logger.info("✅ Gemini API key is valid and working.")
-    except Exception as e:
-        logger.error(f"❌ Gemini API key test failed: {type(e).__name__}: {e}")
-        raise RuntimeError(f"Gemini API key is invalid or quota exceeded: {e}")
-
     # Bigger connection pool to fix TimedOut errors
     trequest = HTTPXRequest(connection_pool_size=20, pool_timeout=30)
     bot = Bot(token=TELEGRAM_BOT_TOKEN, request=trequest)
