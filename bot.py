@@ -6,6 +6,7 @@ import asyncio
 from google import genai
 from flask import Flask, request
 from telegram import Update, Bot
+from telegram.request import HTTPXRequest
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
@@ -15,11 +16,10 @@ PORT               = int(os.environ.get("PORT", 8080))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-flask_app    = Flask(__name__)
-bot          = None
+flask_app     = Flask(__name__)
+bot           = None
 gemini_client = None
 
-# Track users waiting to ask a question (after /bot command)
 waiting_for_question = set()
 
 
@@ -36,66 +36,51 @@ def ask_gemini(question: str) -> str:
 
 
 async def process_update(update_data: dict) -> None:
-    update = Update.de_json(update_data, bot)
+    try:
+        update = Update.de_json(update_data, bot)
 
-    if not update.message or not update.message.text:
-        return
+        msg = update.message or update.channel_post
+        if not msg or not msg.text:
+            return
 
-    msg     = update.message
-    text    = msg.text.strip()
-    chat_id = msg.chat_id
-    user_id = msg.from_user.id if msg.from_user else None
-    chat_type = msg.chat.type  # 'private', 'group', 'supergroup', 'channel'
+        text      = msg.text.strip()
+        chat_id   = msg.chat_id
+        user_id   = msg.from_user.id if msg.from_user else None
+        chat_type = msg.chat.type
 
-    # ── /bot command (works in channel + private + group) ──
-    if text == "/bot" or text.startswith("/bot@"):
-        await bot.send_message(
-            chat_id=chat_id,
-            text="🤖 Tell me your question!",
-        )
-        if user_id:
-            waiting_for_question.add(user_id)
-        return
+        # /bot command
+        if text == "/bot" or text.startswith("/bot@"):
+            await bot.send_message(chat_id=chat_id, text="🤖 Tell me your question!")
+            waiting_for_question.add(user_id if user_id else chat_id)
+            return
 
-    # ── /start command (private chat only) ──
-    if text == "/start" and chat_type == "private":
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "👋 Hello! I'm your AI assistant.\n\n"
-                "Just send me any question and I'll answer it instantly! 🚀\n\n"
-                "Or use /bot to get started."
-            ),
-        )
-        return
-
-    # ── Regular message in PRIVATE chat → always answer ──
-    if chat_type == "private" and not text.startswith("/"):
-        if user_id in waiting_for_question:
-            waiting_for_question.discard(user_id)
-
-        await bot.send_chat_action(chat_id=chat_id, action="typing")
-        answer = ask_gemini(text)
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"🤖 {answer}",
-        )
-        return
-
-    # ── Message in CHANNEL/GROUP after /bot command ──
-    if chat_type in ("group", "supergroup", "channel") and not text.startswith("/"):
-        if user_id and user_id in waiting_for_question:
-            waiting_for_question.discard(user_id)
-            await bot.send_chat_action(chat_id=chat_id, action="typing")
-            answer = ask_gemini(text)
+        # /start in private
+        if text == "/start" and chat_type == "private":
             await bot.send_message(
                 chat_id=chat_id,
-                text=f"🤖 {answer}",
+                text="👋 Hello! Just send me any question and I'll answer it instantly! 🚀",
             )
             return
 
+        # Private chat — always answer any message
+        if chat_type == "private" and not text.startswith("/"):
+            waiting_for_question.discard(user_id)
+            answer = ask_gemini(text)
+            await bot.send_message(chat_id=chat_id, text=f"🤖 {answer}")
+            return
 
-# ── Flask routes ──
+        # Channel / group — answer only after /bot command
+        if chat_type in ("group", "supergroup", "channel") and not text.startswith("/"):
+            track_key = user_id if user_id else chat_id
+            if track_key in waiting_for_question:
+                waiting_for_question.discard(track_key)
+                answer = ask_gemini(text)
+                await bot.send_message(chat_id=chat_id, text=f"🤖 {answer}")
+            return
+
+    except Exception as e:
+        logger.error(f"process_update error: {e}")
+
 
 @flask_app.route("/", methods=["GET"])
 def index():
@@ -104,8 +89,11 @@ def index():
 
 @flask_app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(force=True)
-    asyncio.run(process_update(data))
+    try:
+        data = request.get_json(force=True)
+        asyncio.run(process_update(data))
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
     return "ok", 200
 
 
@@ -120,7 +108,10 @@ def main():
         raise ValueError("Set RENDER_URL!")
 
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+
+    # Bigger connection pool to fix TimedOut errors
+    trequest = HTTPXRequest(connection_pool_size=20, pool_timeout=30)
+    bot = Bot(token=TELEGRAM_BOT_TOKEN, request=trequest)
 
     async def set_webhook():
         await bot.set_webhook(url=f"{RENDER_URL}/webhook")
