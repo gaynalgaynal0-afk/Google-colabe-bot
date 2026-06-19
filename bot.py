@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
 """
-Telegram Channel FAQ Bot — Render-ready
-Flow:
-  1. User sends question → bot instantly replies with AI answer
-  2. Admin gets notified with the question + user ID
-  3. Admin replies with /answer USER_ID <text> → bot forwards to user
+Telegram Channel FAQ Bot — Free & Render Web Service ready
+Uses Google Gemini (FREE) instead of Anthropic
+Uses Webhook instead of polling (required for Render Web Service)
+
+RENDER SETUP:
+  Service type: Web Service
+  Build command: pip install python-telegram-bot==21.3 google-generativeai flask
+  Start command: python bot.py
+  Environment Variables:
+    TELEGRAM_BOT_TOKEN  → from @BotFather
+    GEMINI_API_KEY      → from aistudio.google.com (FREE)
+    ADMIN_IDS           → your Telegram numeric ID e.g. 123456789
+    RENDER_URL          → your Render URL e.g. https://your-app.onrender.com
 """
 
 import os
 import json
 import logging
-import anthropic
+import threading
+import google.generativeai as genai
+from flask import Flask, request
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -21,17 +31,18 @@ from telegram.ext import (
 )
 
 # ═══════════════════════════════════════════════════
-#  CONFIG — read from environment variables on Render
+#  CONFIG — set as environment variables on Render
 # ═══════════════════════════════════════════════════
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
-# ADMIN_IDS: comma-separated in env, e.g. "123456789,987654321"
+GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
+RENDER_URL         = os.environ.get("RENDER_URL", "").rstrip("/")
 ADMIN_IDS = [
     int(x.strip())
     for x in os.environ.get("ADMIN_IDS", "").split(",")
     if x.strip().lstrip("-").isdigit()
 ]
-FAQ_FILE = "/tmp/faq_data.json"   # /tmp is writable on Render
+FAQ_FILE = "/tmp/faq_data.json"
+PORT     = int(os.environ.get("PORT", 8080))
 # ═══════════════════════════════════════════════════
 
 logging.basicConfig(
@@ -40,10 +51,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# Setup Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+
+flask_app = Flask(__name__)
 
 
-# ── FAQ storage ──────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────
+#  FAQ STORAGE
+# ────────────────────────────────────────────────────
 
 def load_faq() -> dict:
     if os.path.exists(FAQ_FILE):
@@ -57,9 +74,11 @@ def save_faq(data: dict) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# ── Claude AI answer ─────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────
+#  GEMINI AI ANSWER (FREE)
+# ────────────────────────────────────────────────────
 
-def ask_claude(user_question: str, faq_data: dict) -> str:
+def ask_gemini(user_question: str, faq_data: dict) -> str:
     channel_info = faq_data.get("channel_info", "")
     qa_pairs     = faq_data.get("qa_pairs", [])
 
@@ -79,7 +98,7 @@ def ask_claude(user_question: str, faq_data: dict) -> str:
         for i, pair in enumerate(qa_pairs, 1):
             knowledge += f"Q{i}: {pair['question']}\nA{i}: {pair['answer']}\n\n"
 
-    system_prompt = f"""You are a helpful FAQ bot for a Telegram channel.
+    prompt = f"""You are a helpful FAQ bot for a Telegram channel.
 Answer ONLY using the knowledge base below. Do NOT use outside knowledge.
 
 RULES:
@@ -90,18 +109,14 @@ RULES:
 
 KNOWLEDGE BASE:
 {knowledge}
-"""
+
+USER QUESTION: {user_question}"""
 
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1000,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_question}],
-        )
-        return response.content[0].text
+        response = gemini_model.generate_content(prompt)
+        return response.text
     except Exception as e:
-        logger.error(f"Claude API error: {e}")
+        logger.error(f"Gemini API error: {e}")
         return (
             "❌ Sorry, I couldn't generate an answer right now. Please try again.\n\n"
             "❌ عذرًا، لم أتمكن من إنشاء إجابة الآن. يرجى المحاولة مرة أخرى."
@@ -112,9 +127,9 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-# ════════════════════════════════════════════════════
-#  HANDLERS
-# ════════════════════════════════════════════════════
+# ────────────────────────────────────────────────────
+#  TELEGRAM HANDLERS
+# ────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -123,7 +138,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "👋 *Welcome, Admin!*\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "📬 *Replying to users:*\n"
-            "`/answer USER\\_ID your reply text`\n\n"
+            "`/answer USER_ID your reply text`\n\n"
             "Example:\n"
             "`/answer 123456789 Yes, we ship worldwide!`\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -133,36 +148,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "`/listqa` — List all Q&A pairs\n"
             "`/deleteqa <number>` — Delete a Q&A pair\n"
             "`/viewinfo` — View current info\n"
-            "`/clearall` — Wipe all data"
+            "`/clearall` — Wipe all FAQ data"
         )
     else:
         text = (
-            "👋 *Welcome\\! / مرحبًا\\!*\n\n"
-            "🤖 I'm the channel assistant\\.\n"
-            "أنا مساعد القناة\\.\n\n"
-            "Just send me your question and I'll answer instantly\\!\n"
-            "فقط أرسل سؤالك وسأجيبك فورًا\\!\n\n"
-            "⬇️ Type your question below\\!\n"
-            "⬇️ اكتب سؤالك أدناه\\!"
+            "👋 *Welcome! / مرحبًا!*\n\n"
+            "🤖 I'm the channel assistant.\n"
+            "أنا مساعد القناة.\n\n"
+            "Just send me your question and I'll answer instantly!\n"
+            "فقط أرسل سؤالك وسأجيبك فورًا!\n\n"
+            "⬇️ Type your question below!\n"
+            "⬇️ اكتب سؤالك أدناه!"
         )
-    await update.message.reply_text(text, parse_mode="MarkdownV2")
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """User sends a message → instant AI reply + notify admin."""
     user     = update.effective_user
     chat_id  = update.effective_chat.id
     question = update.message.text.strip()
-
     if not question:
         return
 
-    # 1. Typing indicator + AI answer
     await update.message.chat.send_action("typing")
     faq_data  = load_faq()
-    ai_answer = ask_claude(question, faq_data)
+    ai_answer = ask_gemini(question, faq_data)
 
-    # 2. Send AI answer to user
     await update.message.reply_text(
         f"🤖 *Answer:*\n\n{ai_answer}\n\n"
         "─────────────────────\n"
@@ -171,7 +182,6 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         parse_mode="Markdown",
     )
 
-    # 3. Notify admins
     username     = f"@{user.username}" if user.username else user.first_name
     admin_notify = (
         f"📬 *New Question from {username}*\n"
@@ -181,7 +191,6 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"To reply, send:\n"
         f"`/answer {chat_id} your reply here`"
     )
-
     for admin_id in ADMIN_IDS:
         try:
             await context.bot.send_message(
@@ -194,11 +203,9 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def admin_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/answer USER_ID reply text"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ This command is for admins only.")
         return
-
     if len(context.args) < 2:
         await update.message.reply_text(
             "Usage: `/answer USER_ID your reply`\n\n"
@@ -206,14 +213,11 @@ async def admin_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             parse_mode="Markdown",
         )
         return
-
     user_id    = context.args[0]
     reply_text = " ".join(context.args[1:])
-
     if not user_id.lstrip("-").isdigit():
         await update.message.reply_text("❌ Invalid User ID. It must be a number.")
         return
-
     try:
         await context.bot.send_message(
             chat_id=int(user_id),
@@ -225,16 +229,14 @@ async def admin_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"❌ Failed to send: {e}")
 
 
-# ── FAQ Management ───────────────────────────────────────────────────────────
-
 async def set_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         return
     if not context.args:
         await update.message.reply_text("Usage: `/setinfo <channel description>`", parse_mode="Markdown")
         return
-    info_text        = " ".join(context.args)
-    faq_data         = load_faq()
+    info_text = " ".join(context.args)
+    faq_data  = load_faq()
     faq_data["channel_info"] = info_text
     save_faq(faq_data)
     await update.message.reply_text(f"✅ Channel info updated!\n\n{info_text}")
@@ -245,9 +247,7 @@ async def add_qa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     full_text = " ".join(context.args)
     if "|" not in full_text or not full_text.lower().startswith("q:"):
-        await update.message.reply_text(
-            "Usage: `/addqa Q: question | A: answer`", parse_mode="Markdown"
-        )
+        await update.message.reply_text("Usage: `/addqa Q: question | A: answer`", parse_mode="Markdown")
         return
     parts    = full_text.split("|", 1)
     question = parts[0].strip()[2:].strip()
@@ -311,31 +311,61 @@ async def clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🗑️ All FAQ data cleared.")
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────
+#  WEBHOOK + FLASK (keeps Render Web Service alive)
+# ────────────────────────────────────────────────────
 
-def main() -> None:
+application = None
+
+
+@flask_app.route("/", methods=["GET"])
+def index():
+    return "✅ Bot is running!", 200
+
+
+@flask_app.route(f"/webhook", methods=["POST"])
+def webhook():
+    import asyncio
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    asyncio.run(application.process_update(update))
+    return "ok", 200
+
+
+async def setup_webhook(app):
+    webhook_url = f"{RENDER_URL}/webhook"
+    await app.bot.set_webhook(url=webhook_url)
+    logger.info(f"✅ Webhook set to {webhook_url}")
+
+
+def main():
+    global application
+
     if not TELEGRAM_BOT_TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
-    if not ANTHROPIC_API_KEY:
-        raise ValueError("ANTHROPIC_API_KEY environment variable is not set!")
+        raise ValueError("❌ Set TELEGRAM_BOT_TOKEN environment variable!")
+    if not GEMINI_API_KEY:
+        raise ValueError("❌ Set GEMINI_API_KEY environment variable!")
     if not ADMIN_IDS:
-        raise ValueError("ADMIN_IDS environment variable is not set!")
+        raise ValueError("❌ Set ADMIN_IDS environment variable!")
+    if not RENDER_URL:
+        raise ValueError("❌ Set RENDER_URL environment variable!")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).updater(None).build()
 
-    app.add_handler(CommandHandler("start",     start))
-    app.add_handler(CommandHandler("answer",    admin_answer))
-    app.add_handler(CommandHandler("setinfo",   set_info))
-    app.add_handler(CommandHandler("addqa",     add_qa))
-    app.add_handler(CommandHandler("listqa",    list_qa))
-    app.add_handler(CommandHandler("deleteqa",  delete_qa))
-    app.add_handler(CommandHandler("viewinfo",  view_info))
-    app.add_handler(CommandHandler("clearall",  clear_all))
+    application.add_handler(CommandHandler("start",     start))
+    application.add_handler(CommandHandler("answer",    admin_answer))
+    application.add_handler(CommandHandler("setinfo",   set_info))
+    application.add_handler(CommandHandler("addqa",     add_qa))
+    application.add_handler(CommandHandler("listqa",    list_qa))
+    application.add_handler(CommandHandler("deleteqa",  delete_qa))
+    application.add_handler(CommandHandler("viewinfo",  view_info))
+    application.add_handler(CommandHandler("clearall",  clear_all))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_question))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_question))
+    import asyncio
+    asyncio.run(setup_webhook(application))
 
-    logger.info("✅ Bot is running on Render...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info(f"✅ Bot running on port {PORT}...")
+    flask_app.run(host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
