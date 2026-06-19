@@ -1,1 +1,1 @@
-worker: python channel_faq_bot.py
+web: python bot.py
