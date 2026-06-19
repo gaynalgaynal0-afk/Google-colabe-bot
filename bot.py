@@ -1,34 +1,18 @@
 #!/usr/bin/env python3
 """
 Telegram Channel FAQ Bot — Free & Render Web Service ready
-Uses Google Gemini (FREE) instead of Anthropic
-Uses Webhook instead of polling (required for Render Web Service)
-
-RENDER SETUP:
-  Service type: Web Service
-  Build command: pip install python-telegram-bot==21.3 google-generativeai flask
-  Start command: python bot.py
-  Environment Variables:
-    TELEGRAM_BOT_TOKEN  → from @BotFather
-    GEMINI_API_KEY      → from aistudio.google.com (FREE)
-    ADMIN_IDS           → your Telegram numeric ID e.g. 123456789
-    RENDER_URL          → your Render URL e.g. https://your-app.onrender.com
+Uses Google Gemini (FREE) - new google-genai package
+Webhook mode for Render Web Service
 """
 
 import os
 import json
 import logging
-import threading
-import google.generativeai as genai
+import asyncio
+from google import genai
 from flask import Flask, request
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
+from telegram import Update, Bot
+from telegram.request import HTTPXRequest
 
 # ═══════════════════════════════════════════════════
 #  CONFIG — set as environment variables on Render
@@ -51,11 +35,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Setup Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-
 flask_app = Flask(__name__)
+bot       = None
+gemini_client = None
 
 
 # ────────────────────────────────────────────────────
@@ -102,8 +84,8 @@ def ask_gemini(user_question: str, faq_data: dict) -> str:
 Answer ONLY using the knowledge base below. Do NOT use outside knowledge.
 
 RULES:
-1. Only answer from the knowledge base. If the answer is not there, say politely that you don't have that info.
-2. Always reply in BOTH English AND Arabic — English first, then a divider line ───, then Arabic.
+1. Only answer from the knowledge base. If not there, say politely you don't have that info.
+2. Always reply in BOTH English AND Arabic — English first, then ───, then Arabic.
 3. Understand questions even with typos or misspellings.
 4. Be concise and friendly.
 
@@ -113,13 +95,16 @@ KNOWLEDGE BASE:
 USER QUESTION: {user_question}"""
 
     try:
-        response = gemini_model.generate_content(prompt)
+        response = gemini_client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+        )
         return response.text
     except Exception as e:
-        logger.error(f"Gemini API error: {e}")
+        logger.error(f"Gemini error: {e}")
         return (
-            "❌ Sorry, I couldn't generate an answer right now. Please try again.\n\n"
-            "❌ عذرًا، لم أتمكن من إنشاء إجابة الآن. يرجى المحاولة مرة أخرى."
+            "❌ Sorry, I couldn't generate an answer right now.\n\n"
+            "❌ عذرًا، لم أتمكن من إنشاء إجابة الآن."
         )
 
 
@@ -128,243 +113,250 @@ def is_admin(user_id: int) -> bool:
 
 
 # ────────────────────────────────────────────────────
-#  TELEGRAM HANDLERS
+#  PROCESS TELEGRAM UPDATE (no PTB Application)
 # ────────────────────────────────────────────────────
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if is_admin(user.id):
-        text = (
-            "👋 *Welcome, Admin!*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "📬 *Replying to users:*\n"
-            "`/answer USER_ID your reply text`\n\n"
-            "Example:\n"
-            "`/answer 123456789 Yes, we ship worldwide!`\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "📋 *FAQ Management:*\n"
-            "`/setinfo <text>` — Set channel description\n"
-            "`/addqa Q: ... | A: ...` — Add Q&A pair\n"
-            "`/listqa` — List all Q&A pairs\n"
-            "`/deleteqa <number>` — Delete a Q&A pair\n"
-            "`/viewinfo` — View current info\n"
-            "`/clearall` — Wipe all FAQ data"
-        )
-    else:
-        text = (
-            "👋 *Welcome! / مرحبًا!*\n\n"
-            "🤖 I'm the channel assistant.\n"
-            "أنا مساعد القناة.\n\n"
-            "Just send me your question and I'll answer instantly!\n"
-            "فقط أرسل سؤالك وسأجيبك فورًا!\n\n"
-            "⬇️ Type your question below!\n"
-            "⬇️ اكتب سؤالك أدناه!"
-        )
-    await update.message.reply_text(text, parse_mode="Markdown")
+async def process_update(update_data: dict) -> None:
+    update = Update.de_json(update_data, bot)
 
-
-async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user     = update.effective_user
-    chat_id  = update.effective_chat.id
-    question = update.message.text.strip()
-    if not question:
+    if not update.message or not update.message.text:
         return
 
-    await update.message.chat.send_action("typing")
-    faq_data  = load_faq()
-    ai_answer = ask_gemini(question, faq_data)
+    msg      = update.message
+    text     = msg.text.strip()
+    user     = msg.from_user
+    chat_id  = msg.chat_id
+    user_id  = user.id
 
-    await update.message.reply_text(
-        f"🤖 *Answer:*\n\n{ai_answer}\n\n"
-        "─────────────────────\n"
-        "📌 The admin has also been notified and may send a more detailed answer.\n"
-        "📌 تم إخطار المشرف وقد يرسل إجابة أكثر تفصيلاً.",
-        parse_mode="Markdown",
-    )
+    # ── Commands ──────────────────────────────────────
 
-    username     = f"@{user.username}" if user.username else user.first_name
-    admin_notify = (
-        f"📬 *New Question from {username}*\n"
-        f"🆔 User ID: `{chat_id}`\n\n"
-        f"❓ *Question:*\n{question}\n\n"
-        f"─────────────────────\n"
-        f"To reply, send:\n"
-        f"`/answer {chat_id} your reply here`"
-    )
-    for admin_id in ADMIN_IDS:
-        try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=admin_notify,
+    if text == "/start":
+        if is_admin(user_id):
+            reply = (
+                "👋 *Welcome, Admin!*\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "📬 *Reply to users:*\n"
+                "`/answer USER_ID your reply`\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "📋 *FAQ Management:*\n"
+                "`/setinfo <text>` — Set channel info\n"
+                "`/addqa Q: ... | A: ...` — Add Q&A\n"
+                "`/listqa` — List Q&A pairs\n"
+                "`/deleteqa <number>` — Delete Q&A\n"
+                "`/viewinfo` — View info\n"
+                "`/clearall` — Clear all data"
+            )
+        else:
+            reply = (
+                "👋 *Welcome! / مرحبًا!*\n\n"
+                "🤖 I'm the channel assistant.\n"
+                "أنا مساعد القناة.\n\n"
+                "Send me your question and I'll answer instantly!\n"
+                "أرسل سؤالك وسأجيبك فورًا!\n\n"
+                "⬇️ Type your question!\n"
+                "⬇️ اكتب سؤالك!"
+            )
+        await bot.send_message(chat_id=chat_id, text=reply, parse_mode="Markdown")
+        return
+
+    # ── Admin: /answer USER_ID reply ─────────────────
+    if text.startswith("/answer"):
+        if not is_admin(user_id):
+            await bot.send_message(chat_id=chat_id, text="❌ Admins only.")
+            return
+        parts = text.split(None, 2)
+        if len(parts) < 3:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="Usage: `/answer USER_ID your reply`",
                 parse_mode="Markdown",
             )
+            return
+        target_id  = parts[1]
+        reply_text = parts[2]
+        if not target_id.lstrip("-").isdigit():
+            await bot.send_message(chat_id=chat_id, text="❌ Invalid User ID.")
+            return
+        try:
+            await bot.send_message(
+                chat_id=int(target_id),
+                text=f"✅ *Admin Reply:*\n\n{reply_text}",
+                parse_mode="Markdown",
+            )
+            await bot.send_message(chat_id=chat_id, text="✅ Reply sent to user.")
         except Exception as e:
-            logger.error(f"Could not notify admin {admin_id}: {e}")
-
-
-async def admin_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ This command is for admins only.")
+            await bot.send_message(chat_id=chat_id, text=f"❌ Failed: {e}")
         return
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "Usage: `/answer USER_ID your reply`\n\n"
-            "Example: `/answer 123456789 Yes, we ship worldwide!`",
+
+    # ── Admin: /setinfo ───────────────────────────────
+    if text.startswith("/setinfo"):
+        if not is_admin(user_id):
+            return
+        info = text[8:].strip()
+        if not info:
+            await bot.send_message(chat_id=chat_id, text="Usage: `/setinfo <text>`", parse_mode="Markdown")
+            return
+        faq = load_faq()
+        faq["channel_info"] = info
+        save_faq(faq)
+        await bot.send_message(chat_id=chat_id, text=f"✅ Channel info updated!\n\n{info}")
+        return
+
+    # ── Admin: /addqa ─────────────────────────────────
+    if text.startswith("/addqa"):
+        if not is_admin(user_id):
+            return
+        body = text[6:].strip()
+        if "|" not in body or not body.lower().startswith("q:"):
+            await bot.send_message(chat_id=chat_id, text="Usage: `/addqa Q: question | A: answer`", parse_mode="Markdown")
+            return
+        parts    = body.split("|", 1)
+        question = parts[0].strip()[2:].strip()
+        answer   = parts[1].strip()[2:].strip() if parts[1].strip().lower().startswith("a:") else parts[1].strip()
+        if not question or not answer:
+            await bot.send_message(chat_id=chat_id, text="❌ Both question and answer required.")
+            return
+        faq = load_faq()
+        faq["qa_pairs"].append({"question": question, "answer": answer})
+        save_faq(faq)
+        await bot.send_message(chat_id=chat_id, text=f"✅ Q&A added!\n\n❓ {question}\n💬 {answer}")
+        return
+
+    # ── Admin: /listqa ────────────────────────────────
+    if text == "/listqa":
+        if not is_admin(user_id):
+            return
+        faq   = load_faq()
+        pairs = faq.get("qa_pairs", [])
+        if not pairs:
+            await bot.send_message(chat_id=chat_id, text="📭 No Q&A pairs yet.")
+            return
+        lines = ["📋 *All Q&A Pairs:*\n"]
+        for i, pair in enumerate(pairs, 1):
+            lines.append(f"*{i}.* ❓ {pair['question']}\n   💬 {pair['answer']}\n")
+        await bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown")
+        return
+
+    # ── Admin: /deleteqa ──────────────────────────────
+    if text.startswith("/deleteqa"):
+        if not is_admin(user_id):
+            return
+        parts = text.split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            await bot.send_message(chat_id=chat_id, text="Usage: `/deleteqa <number>`", parse_mode="Markdown")
+            return
+        index = int(parts[1]) - 1
+        faq   = load_faq()
+        pairs = faq.get("qa_pairs", [])
+        if index < 0 or index >= len(pairs):
+            await bot.send_message(chat_id=chat_id, text=f"❌ Invalid number. You have {len(pairs)} pairs.")
+            return
+        removed = pairs.pop(index)
+        save_faq(faq)
+        await bot.send_message(chat_id=chat_id, text=f"🗑️ Deleted: {removed['question']}")
+        return
+
+    # ── Admin: /viewinfo ──────────────────────────────
+    if text == "/viewinfo":
+        if not is_admin(user_id):
+            return
+        faq   = load_faq()
+        info  = faq.get("channel_info", "(none set)")
+        pairs = faq.get("qa_pairs", [])
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"📄 *Channel Info:*\n{info}\n\n📋 *Q&A Pairs:* {len(pairs)} total",
             parse_mode="Markdown",
         )
         return
-    user_id    = context.args[0]
-    reply_text = " ".join(context.args[1:])
-    if not user_id.lstrip("-").isdigit():
-        await update.message.reply_text("❌ Invalid User ID. It must be a number.")
+
+    # ── Admin: /clearall ──────────────────────────────
+    if text == "/clearall":
+        if not is_admin(user_id):
+            return
+        save_faq({"channel_info": "", "qa_pairs": []})
+        await bot.send_message(chat_id=chat_id, text="🗑️ All FAQ data cleared.")
         return
-    try:
-        await context.bot.send_message(
-            chat_id=int(user_id),
-            text=f"✅ *Admin Reply:*\n\n{reply_text}",
+
+    # ── Regular user question ─────────────────────────
+    if not text.startswith("/"):
+        await bot.send_chat_action(chat_id=chat_id, action="typing")
+        faq_data  = load_faq()
+        ai_answer = ask_gemini(text, faq_data)
+
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"🤖 *Answer:*\n\n{ai_answer}\n\n"
+                "─────────────────────\n"
+                "📌 The admin has also been notified and may send a more detailed answer.\n"
+                "📌 تم إخطار المشرف وقد يرسل إجابة أكثر تفصيلاً."
+            ),
             parse_mode="Markdown",
         )
-        await update.message.reply_text("✅ Your reply has been sent to the user.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to send: {e}")
 
-
-async def set_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: `/setinfo <channel description>`", parse_mode="Markdown")
-        return
-    info_text = " ".join(context.args)
-    faq_data  = load_faq()
-    faq_data["channel_info"] = info_text
-    save_faq(faq_data)
-    await update.message.reply_text(f"✅ Channel info updated!\n\n{info_text}")
-
-
-async def add_qa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
-        return
-    full_text = " ".join(context.args)
-    if "|" not in full_text or not full_text.lower().startswith("q:"):
-        await update.message.reply_text("Usage: `/addqa Q: question | A: answer`", parse_mode="Markdown")
-        return
-    parts    = full_text.split("|", 1)
-    question = parts[0].strip()[2:].strip()
-    answer   = parts[1].strip()[2:].strip() if parts[1].strip().lower().startswith("a:") else parts[1].strip()
-    if not question or not answer:
-        await update.message.reply_text("❌ Both question and answer are required.")
-        return
-    faq_data = load_faq()
-    faq_data["qa_pairs"].append({"question": question, "answer": answer})
-    save_faq(faq_data)
-    await update.message.reply_text(f"✅ Q&A added!\n\n❓ {question}\n💬 {answer}")
-
-
-async def list_qa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
-        return
-    faq_data = load_faq()
-    pairs    = faq_data.get("qa_pairs", [])
-    if not pairs:
-        await update.message.reply_text("📭 No Q&A pairs yet. Use /addqa to add some.")
-        return
-    lines = ["📋 *All Q&A Pairs:*\n"]
-    for i, pair in enumerate(pairs, 1):
-        lines.append(f"*{i}.* ❓ {pair['question']}\n   💬 {pair['answer']}\n")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def delete_qa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage: `/deleteqa <number>`", parse_mode="Markdown")
-        return
-    index    = int(context.args[0]) - 1
-    faq_data = load_faq()
-    pairs    = faq_data.get("qa_pairs", [])
-    if index < 0 or index >= len(pairs):
-        await update.message.reply_text(f"❌ Invalid number. You have {len(pairs)} pairs.")
-        return
-    removed = pairs.pop(index)
-    save_faq(faq_data)
-    await update.message.reply_text(f"🗑️ Deleted: {removed['question']}")
-
-
-async def view_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
-        return
-    faq_data = load_faq()
-    info     = faq_data.get("channel_info", "(none set)")
-    pairs    = faq_data.get("qa_pairs", [])
-    await update.message.reply_text(
-        f"📄 *Channel Info:*\n{info}\n\n📋 *Q&A Pairs:* {len(pairs)} total",
-        parse_mode="Markdown",
-    )
-
-
-async def clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
-        return
-    save_faq({"channel_info": "", "qa_pairs": []})
-    await update.message.reply_text("🗑️ All FAQ data cleared.")
+        username     = f"@{user.username}" if user.username else user.first_name
+        admin_notify = (
+            f"📬 *New Question from {username}*\n"
+            f"🆔 User ID: `{chat_id}`\n\n"
+            f"❓ *Question:*\n{text}\n\n"
+            f"─────────────────────\n"
+            f"To reply:\n`/answer {chat_id} your reply here`"
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=admin_notify,
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.error(f"Could not notify admin {admin_id}: {e}")
 
 
 # ────────────────────────────────────────────────────
-#  WEBHOOK + FLASK (keeps Render Web Service alive)
+#  FLASK ROUTES
 # ────────────────────────────────────────────────────
-
-application = None
-
 
 @flask_app.route("/", methods=["GET"])
 def index():
     return "✅ Bot is running!", 200
 
 
-@flask_app.route(f"/webhook", methods=["POST"])
+@flask_app.route("/webhook", methods=["POST"])
 def webhook():
-    import asyncio
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    asyncio.run(application.process_update(update))
+    data = request.get_json(force=True)
+    asyncio.run(process_update(data))
     return "ok", 200
 
 
-async def setup_webhook(app):
-    webhook_url = f"{RENDER_URL}/webhook"
-    await app.bot.set_webhook(url=webhook_url)
-    logger.info(f"✅ Webhook set to {webhook_url}")
-
+# ────────────────────────────────────────────────────
+#  MAIN
+# ────────────────────────────────────────────────────
 
 def main():
-    global application
+    global bot, gemini_client
 
     if not TELEGRAM_BOT_TOKEN:
-        raise ValueError("❌ Set TELEGRAM_BOT_TOKEN environment variable!")
+        raise ValueError("❌ Set TELEGRAM_BOT_TOKEN!")
     if not GEMINI_API_KEY:
-        raise ValueError("❌ Set GEMINI_API_KEY environment variable!")
+        raise ValueError("❌ Set GEMINI_API_KEY!")
     if not ADMIN_IDS:
-        raise ValueError("❌ Set ADMIN_IDS environment variable!")
+        raise ValueError("❌ Set ADMIN_IDS!")
     if not RENDER_URL:
-        raise ValueError("❌ Set RENDER_URL environment variable!")
+        raise ValueError("❌ Set RENDER_URL!")
 
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).updater(None).build()
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-    application.add_handler(CommandHandler("start",     start))
-    application.add_handler(CommandHandler("answer",    admin_answer))
-    application.add_handler(CommandHandler("setinfo",   set_info))
-    application.add_handler(CommandHandler("addqa",     add_qa))
-    application.add_handler(CommandHandler("listqa",    list_qa))
-    application.add_handler(CommandHandler("deleteqa",  delete_qa))
-    application.add_handler(CommandHandler("viewinfo",  view_info))
-    application.add_handler(CommandHandler("clearall",  clear_all))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_question))
+    # Set webhook
+    async def set_wh():
+        await bot.set_webhook(url=f"{RENDER_URL}/webhook")
+        logger.info(f"✅ Webhook → {RENDER_URL}/webhook")
 
-    import asyncio
-    asyncio.run(setup_webhook(application))
+    asyncio.run(set_wh())
 
-    logger.info(f"✅ Bot running on port {PORT}...")
+    logger.info(f"✅ Running on port {PORT}")
     flask_app.run(host="0.0.0.0", port=PORT)
 
 
