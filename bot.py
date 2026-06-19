@@ -24,15 +24,32 @@ waiting_for_question = set()
 
 
 def ask_gemini(question: str) -> str:
-    try:
-        response = gemini_client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=question,
-        )
-        return response.text
-    except Exception as e:
-        logger.error(f"Gemini error: {e}")
-        return "❌ Sorry, couldn't get an answer right now. Try again!"
+    models_to_try = ["gemini-2.0-flash", "gemini-2.0-flash-001", "gemini-1.5-flash"]
+    last_error = None
+
+    for model in models_to_try:
+        try:
+            logger.info(f"Trying model: {model}")
+            response = gemini_client.models.generate_content(
+                model=model,
+                contents=question,
+            )
+            if response.text:
+                logger.info(f"✅ Got response from {model}")
+                return response.text
+            else:
+                logger.warning(f"Empty response from {model}")
+        except Exception as e:
+            last_error = e
+            logger.error(f"Gemini error with model {model}: {type(e).__name__}: {e}")
+            # If it's an auth error, no point trying other models
+            error_str = str(e).lower()
+            if "api key" in error_str or "permission" in error_str or "unauthorized" in error_str or "authentication" in error_str:
+                logger.error("❌ API key issue detected — check your GEMINI_API_KEY environment variable.")
+                return "❌ Bot configuration error. Please contact the admin."
+
+    logger.error(f"All models failed. Last error: {last_error}")
+    return "❌ Sorry, couldn't get an answer right now. Try again!"
 
 
 async def process_update(update_data: dict) -> None:
@@ -108,6 +125,17 @@ def main():
         raise ValueError("Set RENDER_URL!")
 
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+    # Validate Gemini API key works at startup
+    try:
+        test = gemini_client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents="ping",
+        )
+        logger.info("✅ Gemini API key is valid and working.")
+    except Exception as e:
+        logger.error(f"❌ Gemini API key test failed: {type(e).__name__}: {e}")
+        raise RuntimeError(f"Gemini API key is invalid or quota exceeded: {e}")
 
     # Bigger connection pool to fix TimedOut errors
     trequest = HTTPXRequest(connection_pool_size=20, pool_timeout=30)
