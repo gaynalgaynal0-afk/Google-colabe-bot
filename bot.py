@@ -9,6 +9,7 @@ import os
 import json
 import logging
 import asyncio
+import threading
 from google import genai
 from flask import Flask, request
 from telegram import Update, Bot
@@ -38,6 +39,7 @@ logger = logging.getLogger(__name__)
 flask_app = Flask(__name__)
 bot       = None
 gemini_client = None
+loop      = None  # persistent asyncio event loop, set up in main()
 
 
 # ────────────────────────────────────────────────────
@@ -326,7 +328,13 @@ def index():
 @flask_app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(force=True)
-    asyncio.run(process_update(data))
+    # Schedule the coroutine on the single persistent event loop instead of
+    # spinning up a new loop (and a new, disconnected HTTPX pool) every call.
+    future = asyncio.run_coroutine_threadsafe(process_update(data), loop)
+    try:
+        future.result(timeout=25)  # don't block Flask forever if Telegram is slow
+    except Exception as e:
+        logger.error(f"process_update failed: {e}")
     return "ok", 200
 
 
@@ -335,7 +343,7 @@ def webhook():
 # ────────────────────────────────────────────────────
 
 def main():
-    global bot, gemini_client
+    global bot, gemini_client, loop
 
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("❌ Set TELEGRAM_BOT_TOKEN!")
@@ -347,14 +355,30 @@ def main():
         raise ValueError("❌ Set RENDER_URL!")
 
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-    # Set webhook
-    async def set_wh():
+    # Give the bot its own HTTPX request object with a larger connection pool
+    # and a sane pool timeout, so a burst of messages doesn't exhaust it.
+    request_obj = HTTPXRequest(connection_pool_size=8, pool_timeout=10)
+    bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request_obj)
+
+    # Create ONE event loop that lives for the lifetime of the process and
+    # run it forever in a background thread. Every webhook call schedules
+    # its coroutine onto this same loop via run_coroutine_threadsafe, so the
+    # bot's HTTPX connection pool is only ever used from one consistent loop.
+    loop = asyncio.new_event_loop()
+
+    def _run_loop():
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    threading.Thread(target=_run_loop, daemon=True).start()
+
+    async def setup():
+        await bot.initialize()
         await bot.set_webhook(url=f"{RENDER_URL}/webhook")
         logger.info(f"✅ Webhook → {RENDER_URL}/webhook")
 
-    asyncio.run(set_wh())
+    asyncio.run_coroutine_threadsafe(setup(), loop).result()
 
     logger.info(f"✅ Running on port {PORT}")
     flask_app.run(host="0.0.0.0", port=PORT)
