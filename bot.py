@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Channel FAQ Bot — Full AI + Channel Info
+Telegram Channel FAQ Bot — Permanent Database Storage (Supabase)
 """
 
 import os
@@ -8,20 +8,22 @@ import json
 import logging
 import asyncio
 import httpx
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import Flask, request
 
 # ═══════════════════════════════════════════════════
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 RENDER_URL         = os.environ.get("RENDER_URL", "").rstrip("/")
+DATABASE_URL       = os.environ.get("DATABASE_URL", "")
 ADMIN_IDS = [
     int(x.strip())
     for x in os.environ.get("ADMIN_IDS", "").split(",")
     if x.strip().lstrip("-").isdigit()
 ]
-FAQ_FILE = "/tmp/faq_data.json"
-PORT     = int(os.environ.get("PORT", 8080))
-TG_API   = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+PORT   = int(os.environ.get("PORT", 8080))
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 # ═══════════════════════════════════════════════════
 
 logging.basicConfig(
@@ -30,6 +32,87 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 flask_app = Flask(__name__)
+
+
+# ── Database ──────────────────────────────────────────────────────────────────
+
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+def init_db():
+    """Create tables if they don't exist."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS faq_config (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS qa_pairs (
+                    id       SERIAL PRIMARY KEY,
+                    question TEXT NOT NULL,
+                    answer   TEXT NOT NULL
+                );
+            """)
+        conn.commit()
+    logger.info("✅ Database initialized")
+
+def load_faq() -> dict:
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT value FROM faq_config WHERE key = 'channel_info'")
+                row = cur.fetchone()
+                channel_info = row["value"] if row else ""
+
+                cur.execute("SELECT question, answer FROM qa_pairs ORDER BY id")
+                pairs = [{"question": r["question"], "answer": r["answer"]} for r in cur.fetchall()]
+
+        return {"channel_info": channel_info, "qa_pairs": pairs}
+    except Exception as e:
+        logger.error(f"load_faq error: {e}")
+        return {"channel_info": "", "qa_pairs": []}
+
+def save_channel_info(info: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO faq_config (key, value)
+                VALUES ('channel_info', %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, (info,))
+        conn.commit()
+
+def add_qa(question: str, answer: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO qa_pairs (question, answer) VALUES (%s, %s)",
+                (question, answer)
+            )
+        conn.commit()
+
+def delete_qa(index: int) -> dict | None:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, question FROM qa_pairs ORDER BY id")
+            rows = cur.fetchall()
+            if index < 0 or index >= len(rows):
+                return None
+            row_id = rows[index]["id"]
+            question = rows[index]["question"]
+            cur.execute("DELETE FROM qa_pairs WHERE id = %s", (row_id,))
+        conn.commit()
+    return {"question": question}
+
+def clear_all_faq():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM qa_pairs")
+            cur.execute("DELETE FROM faq_config WHERE key = 'channel_info'")
+        conn.commit()
 
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
@@ -61,26 +144,12 @@ async def tg_set_webhook(url: str) -> None:
         logger.info(f"✅ Webhook → {r.json()}")
 
 
-# ── FAQ storage ───────────────────────────────────────────────────────────────
-
-def load_faq() -> dict:
-    if os.path.exists(FAQ_FILE):
-        with open(FAQ_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"channel_info": "", "qa_pairs": []}
-
-def save_faq(data: dict) -> None:
-    with open(FAQ_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
 # ── AI ────────────────────────────────────────────────────────────────────────
 
 async def ask_ai(question: str, faq_data: dict) -> str:
     channel_info = faq_data.get("channel_info", "")
     qa_pairs     = faq_data.get("qa_pairs", [])
 
-    # Build channel knowledge section
     channel_knowledge = ""
     if channel_info:
         channel_knowledge += f"=== Channel Info ===\n{channel_info}\n\n"
@@ -91,7 +160,6 @@ async def ask_ai(question: str, faq_data: dict) -> str:
 
     if channel_knowledge:
         system = f"""You are a smart AI assistant for a Telegram channel.
-
 You can answer ANY question the user asks like a real AI.
 You also have special knowledge about this channel — if the question is related to the channel, prioritize that info.
 
@@ -132,10 +200,10 @@ Be friendly, concise and helpful. Understand typos and misspellings."""
                 return data["choices"][0]["message"]["content"].strip()
             else:
                 logger.error(f"Unexpected response: {data}")
-                return "❌ Could not generate answer right now.\n\n❌ لم أتمكن من إنشاء إجابة الآن."
+                return "❌ Could not generate answer.\n\n❌ لم أتمكن من إنشاء إجابة."
     except Exception as e:
         logger.error(f"AI error: {e}")
-        return "❌ Could not generate answer right now.\n\n❌ لم أتمكن من إنشاء إجابة الآن."
+        return "❌ Could not generate answer.\n\n❌ لم أتمكن من إنشاء إجابة."
 
 
 def is_admin(uid: int) -> bool:
@@ -210,10 +278,8 @@ async def handle(data: dict) -> None:
         if not info:
             await tg_send(chat_id, "Usage: `/setinfo <description>`")
             return
-        faq = load_faq()
-        faq["channel_info"] = info
-        save_faq(faq)
-        await tg_send(chat_id, f"✅ Channel info updated!\n\n{info}")
+        save_channel_info(info)
+        await tg_send(chat_id, f"✅ Channel info saved permanently!\n\n{info}")
         return
 
     # /addqa
@@ -229,10 +295,8 @@ async def handle(data: dict) -> None:
         if not question or not answer:
             await tg_send(chat_id, "❌ Both question and answer required.")
             return
-        faq = load_faq()
-        faq["qa_pairs"].append({"question": question, "answer": answer})
-        save_faq(faq)
-        await tg_send(chat_id, f"✅ Q&A added!\n\n❓ {question}\n💬 {answer}")
+        add_qa(question, answer)
+        await tg_send(chat_id, f"✅ Q&A saved permanently!\n\n❓ {question}\n💬 {answer}")
         return
 
     # /listqa
@@ -256,14 +320,11 @@ async def handle(data: dict) -> None:
         if len(parts) < 2 or not parts[1].isdigit():
             await tg_send(chat_id, "Usage: `/deleteqa <number>`")
             return
-        idx   = int(parts[1]) - 1
-        faq   = load_faq()
-        pairs = faq.get("qa_pairs", [])
-        if idx < 0 or idx >= len(pairs):
-            await tg_send(chat_id, f"❌ Invalid. You have {len(pairs)} pairs.")
+        removed = delete_qa(int(parts[1]) - 1)
+        if not removed:
+            faq = load_faq()
+            await tg_send(chat_id, f"❌ Invalid number. You have {len(faq['qa_pairs'])} pairs.")
             return
-        removed = pairs.pop(idx)
-        save_faq(faq)
         await tg_send(chat_id, f"🗑️ Deleted: {removed['question']}")
         return
 
@@ -279,8 +340,8 @@ async def handle(data: dict) -> None:
     # /clearall
     if text == "/clearall":
         if not is_admin(uid): return
-        save_faq({"channel_info": "", "qa_pairs": []})
-        await tg_send(chat_id, "🗑️ All data cleared.")
+        clear_all_faq()
+        await tg_send(chat_id, "🗑️ All data cleared from database.")
         return
 
     # Any message → full AI answer
@@ -289,7 +350,6 @@ async def handle(data: dict) -> None:
         answer = await ask_ai(text, load_faq())
         await tg_send(chat_id, f"🤖 {answer}")
 
-        # Notify admin
         notify = (
             f"📬 *New Message from {uname}*\n"
             f"🆔 User ID: `{chat_id}`\n"
@@ -331,11 +391,14 @@ def main():
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
         "RENDER_URL":         RENDER_URL,
+        "DATABASE_URL":       DATABASE_URL,
     }.items() if not v]
     if missing:
         raise ValueError(f"❌ Missing: {', '.join(missing)}")
     if not ADMIN_IDS:
         raise ValueError("❌ Set ADMIN_IDS!")
+
+    init_db()
 
     loop = asyncio.new_event_loop()
     loop.run_until_complete(tg_set_webhook(f"{RENDER_URL}/webhook"))
