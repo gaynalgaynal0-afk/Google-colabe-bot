@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Channel FAQ Bot — Uses OpenRouter (FREE)
+Telegram Channel FAQ Bot — Full AI + Channel Info
 """
 
 import os
@@ -11,9 +11,9 @@ import httpx
 from flask import Flask, request
 
 # ═══════════════════════════════════════════════════
-TELEGRAM_BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-OPENROUTER_API_KEY  = os.environ.get("OPENROUTER_API_KEY", "")
-RENDER_URL          = os.environ.get("RENDER_URL", "").rstrip("/")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+RENDER_URL         = os.environ.get("RENDER_URL", "").rstrip("/")
 ADMIN_IDS = [
     int(x.strip())
     for x in os.environ.get("ADMIN_IDS", "").split(",")
@@ -74,35 +74,41 @@ def save_faq(data: dict) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# ── OpenRouter AI ─────────────────────────────────────────────────────────────
+# ── AI ────────────────────────────────────────────────────────────────────────
 
 async def ask_ai(question: str, faq_data: dict) -> str:
     channel_info = faq_data.get("channel_info", "")
     qa_pairs     = faq_data.get("qa_pairs", [])
 
-    if not channel_info and not qa_pairs:
-        return (
-            "⚠️ No channel information set up yet.\n\n"
-            "⚠️ لم يتم إعداد معلومات القناة بعد.\n\n"
-            "The admin will answer you soon. / سيجيبك المشرف قريبًا."
-        )
-
-    knowledge = ""
+    # Build channel knowledge section
+    channel_knowledge = ""
     if channel_info:
-        knowledge += f"=== Channel Info ===\n{channel_info}\n\n"
+        channel_knowledge += f"=== Channel Info ===\n{channel_info}\n\n"
     if qa_pairs:
-        knowledge += "=== FAQ ===\n"
+        channel_knowledge += "=== Channel FAQ ===\n"
         for i, p in enumerate(qa_pairs, 1):
-            knowledge += f"Q{i}: {p['question']}\nA{i}: {p['answer']}\n\n"
+            channel_knowledge += f"Q{i}: {p['question']}\nA{i}: {p['answer']}\n\n"
 
-    system = f"""You are a FAQ bot for a Telegram channel.
-Answer ONLY from the knowledge base below. Do NOT use outside knowledge.
-Reply in BOTH English AND Arabic (English first, then ───, then Arabic).
-Understand typos. Be concise and friendly.
-If the answer is not in the knowledge base, say politely you don't have that info.
+    if channel_knowledge:
+        system = f"""You are a smart AI assistant for a Telegram channel.
 
-KNOWLEDGE BASE:
-{knowledge}"""
+You can answer ANY question the user asks like a real AI.
+You also have special knowledge about this channel — if the question is related to the channel, prioritize that info.
+
+CHANNEL KNOWLEDGE:
+{channel_knowledge}
+
+RULES:
+- Answer any question helpfully and accurately
+- If the question is about the channel, use the channel knowledge above
+- Always reply in BOTH English AND Arabic (English first, then ───, then Arabic)
+- Be friendly, concise and helpful
+- Understand typos and misspellings"""
+    else:
+        system = """You are a smart AI assistant for a Telegram channel.
+Answer any question helpfully and accurately.
+Always reply in BOTH English AND Arabic (English first, then ───, then Arabic).
+Be friendly, concise and helpful. Understand typos and misspellings."""
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -118,17 +124,18 @@ KNOWLEDGE BASE:
                         {"role": "system", "content": system},
                         {"role": "user",   "content": question},
                     ],
-                    "max_tokens": 500,
+                    "max_tokens": 600,
                 },
             )
             data = r.json()
-            return data["choices"][0]["message"]["content"].strip()
+            if "choices" in data:
+                return data["choices"][0]["message"]["content"].strip()
+            else:
+                logger.error(f"Unexpected response: {data}")
+                return "❌ Could not generate answer right now.\n\n❌ لم أتمكن من إنشاء إجابة الآن."
     except Exception as e:
         logger.error(f"AI error: {e}")
-        return (
-            "❌ Could not generate answer right now.\n\n"
-            "❌ لم أتمكن من إنشاء إجابة الآن."
-        )
+        return "❌ Could not generate answer right now.\n\n❌ لم أتمكن من إنشاء إجابة الآن."
 
 
 def is_admin(uid: int) -> bool:
@@ -173,9 +180,10 @@ async def handle(data: dict) -> None:
         else:
             reply = (
                 "👋 *Welcome! / مرحبًا!*\n\n"
-                "🤖 I'm the channel assistant / أنا مساعد القناة\n\n"
-                "Send your question and I'll answer instantly!\n"
-                "أرسل سؤالك وسأجيبك فورًا!\n\n"
+                "🤖 I'm a smart AI assistant for this channel!\n"
+                "أنا مساعد ذكاء اصطناعي لهذه القناة!\n\n"
+                "Ask me *anything* — I can answer any question!\n"
+                "اسألني *أي شيء* — يمكنني الإجابة على أي سؤال!\n\n"
                 "⬇️ Type your question / اكتب سؤالك"
             )
         await tg_send(chat_id, reply)
@@ -275,19 +283,15 @@ async def handle(data: dict) -> None:
         await tg_send(chat_id, "🗑️ All data cleared.")
         return
 
-    # Regular question
+    # Any message → full AI answer
     if not text.startswith("/"):
         await tg_action(chat_id)
         answer = await ask_ai(text, load_faq())
-        await tg_send(
-            chat_id,
-            f"🤖 *Answer:*\n\n{answer}\n\n"
-            "─────────────────────\n"
-            "📌 Admin notified for a detailed answer.\n"
-            "📌 تم إخطار المشرف لإجابة مفصلة.",
-        )
+        await tg_send(chat_id, f"🤖 {answer}")
+
+        # Notify admin
         notify = (
-            f"📬 *New Question from {uname}*\n"
+            f"📬 *New Message from {uname}*\n"
             f"🆔 User ID: `{chat_id}`\n"
             f"💬 Chat: `{chat_type}`\n\n"
             f"❓ *Question:*\n{text}\n\n"
