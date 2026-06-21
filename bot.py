@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Channel FAQ Bot — Permanent Database Storage (Supabase)
+Telegram Channel FAQ Bot — JSONBin.io permanent storage (FREE)
 """
 
 import os
@@ -8,15 +8,14 @@ import json
 import logging
 import asyncio
 import httpx
-import psycopg2
-from psycopg2.extras import RealDictCursor
 from flask import Flask, request
 
 # ═══════════════════════════════════════════════════
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 RENDER_URL         = os.environ.get("RENDER_URL", "").rstrip("/")
-DATABASE_URL       = os.environ.get("DATABASE_URL", "")
+JSONBIN_KEY        = os.environ.get("JSONBIN_KEY", "")
+JSONBIN_BIN_ID     = os.environ.get("JSONBIN_BIN_ID", "")  # set after first run
 ADMIN_IDS = [
     int(x.strip())
     for x in os.environ.get("ADMIN_IDS", "").split(",")
@@ -33,86 +32,64 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 flask_app = Flask(__name__)
 
+JSONBIN_URL = "https://api.jsonbin.io/v3"
+DEFAULT_FAQ = {"channel_info": "", "qa_pairs": []}
 
-# ── Database ──────────────────────────────────────────────────────────────────
 
-def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+# ── JSONBin storage ───────────────────────────────────────────────────────────
 
-def init_db():
-    """Create tables if they don't exist."""
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS faq_config (
-                    key   TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS qa_pairs (
-                    id       SERIAL PRIMARY KEY,
-                    question TEXT NOT NULL,
-                    answer   TEXT NOT NULL
-                );
-            """)
-        conn.commit()
-    logger.info("✅ Database initialized")
+async def jsonbin_read() -> dict:
+    bin_id = os.environ.get("JSONBIN_BIN_ID", "")
+    if not bin_id:
+        return DEFAULT_FAQ.copy()
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            f"{JSONBIN_URL}/b/{bin_id}/latest",
+            headers={"X-Master-Key": JSONBIN_KEY},
+        )
+        if r.status_code == 200:
+            return r.json().get("record", DEFAULT_FAQ.copy())
+        logger.error(f"JSONBin read error: {r.text}")
+        return DEFAULT_FAQ.copy()
 
-def load_faq() -> dict:
-    try:
-        with get_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT value FROM faq_config WHERE key = 'channel_info'")
-                row = cur.fetchone()
-                channel_info = row["value"] if row else ""
 
-                cur.execute("SELECT question, answer FROM qa_pairs ORDER BY id")
-                pairs = [{"question": r["question"], "answer": r["answer"]} for r in cur.fetchall()]
-
-        return {"channel_info": channel_info, "qa_pairs": pairs}
-    except Exception as e:
-        logger.error(f"load_faq error: {e}")
-        return {"channel_info": "", "qa_pairs": []}
-
-def save_channel_info(info: str):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO faq_config (key, value)
-                VALUES ('channel_info', %s)
-                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-            """, (info,))
-        conn.commit()
-
-def add_qa(question: str, answer: str):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO qa_pairs (question, answer) VALUES (%s, %s)",
-                (question, answer)
+async def jsonbin_write(data: dict) -> bool:
+    bin_id = os.environ.get("JSONBIN_BIN_ID", "")
+    if not bin_id:
+        # Create a new bin
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                f"{JSONBIN_URL}/b",
+                headers={
+                    "X-Master-Key": JSONBIN_KEY,
+                    "Content-Type": "application/json",
+                    "X-Bin-Name": "faq-bot-data",
+                    "X-Bin-Private": "true",
+                },
+                json=data,
             )
-        conn.commit()
-
-def delete_qa(index: int) -> dict | None:
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id, question FROM qa_pairs ORDER BY id")
-            rows = cur.fetchall()
-            if index < 0 or index >= len(rows):
-                return None
-            row_id = rows[index]["id"]
-            question = rows[index]["question"]
-            cur.execute("DELETE FROM qa_pairs WHERE id = %s", (row_id,))
-        conn.commit()
-    return {"question": question}
-
-def clear_all_faq():
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM qa_pairs")
-            cur.execute("DELETE FROM faq_config WHERE key = 'channel_info'")
-        conn.commit()
+            if r.status_code == 200:
+                new_id = r.json()["metadata"]["id"]
+                os.environ["JSONBIN_BIN_ID"] = new_id
+                logger.info(f"✅ Created JSONBin with ID: {new_id}")
+                logger.info(f"⚠️  Add JSONBIN_BIN_ID={new_id} to Render env vars!")
+                return True
+            logger.error(f"JSONBin create error: {r.text}")
+            return False
+    else:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.put(
+                f"{JSONBIN_URL}/b/{bin_id}",
+                headers={
+                    "X-Master-Key": JSONBIN_KEY,
+                    "Content-Type": "application/json",
+                },
+                json=data,
+            )
+            if r.status_code == 200:
+                return True
+            logger.error(f"JSONBin write error: {r.text}")
+            return False
 
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
@@ -198,9 +175,8 @@ Be friendly, concise and helpful. Understand typos and misspellings."""
             data = r.json()
             if "choices" in data:
                 return data["choices"][0]["message"]["content"].strip()
-            else:
-                logger.error(f"Unexpected response: {data}")
-                return "❌ Could not generate answer.\n\n❌ لم أتمكن من إنشاء إجابة."
+            logger.error(f"AI bad response: {data}")
+            return "❌ Could not generate answer.\n\n❌ لم أتمكن من إنشاء إجابة."
     except Exception as e:
         logger.error(f"AI error: {e}")
         return "❌ Could not generate answer.\n\n❌ لم أتمكن من إنشاء إجابة."
@@ -278,7 +254,9 @@ async def handle(data: dict) -> None:
         if not info:
             await tg_send(chat_id, "Usage: `/setinfo <description>`")
             return
-        save_channel_info(info)
+        faq = await jsonbin_read()
+        faq["channel_info"] = info
+        await jsonbin_write(faq)
         await tg_send(chat_id, f"✅ Channel info saved permanently!\n\n{info}")
         return
 
@@ -295,14 +273,16 @@ async def handle(data: dict) -> None:
         if not question or not answer:
             await tg_send(chat_id, "❌ Both question and answer required.")
             return
-        add_qa(question, answer)
+        faq = await jsonbin_read()
+        faq["qa_pairs"].append({"question": question, "answer": answer})
+        await jsonbin_write(faq)
         await tg_send(chat_id, f"✅ Q&A saved permanently!\n\n❓ {question}\n💬 {answer}")
         return
 
     # /listqa
     if text == "/listqa":
         if not is_admin(uid): return
-        faq   = load_faq()
+        faq   = await jsonbin_read()
         pairs = faq.get("qa_pairs", [])
         if not pairs:
             await tg_send(chat_id, "📭 No Q&A pairs yet.")
@@ -320,18 +300,21 @@ async def handle(data: dict) -> None:
         if len(parts) < 2 or not parts[1].isdigit():
             await tg_send(chat_id, "Usage: `/deleteqa <number>`")
             return
-        removed = delete_qa(int(parts[1]) - 1)
-        if not removed:
-            faq = load_faq()
-            await tg_send(chat_id, f"❌ Invalid number. You have {len(faq['qa_pairs'])} pairs.")
+        idx   = int(parts[1]) - 1
+        faq   = await jsonbin_read()
+        pairs = faq.get("qa_pairs", [])
+        if idx < 0 or idx >= len(pairs):
+            await tg_send(chat_id, f"❌ Invalid. You have {len(pairs)} pairs.")
             return
+        removed = pairs.pop(idx)
+        await jsonbin_write(faq)
         await tg_send(chat_id, f"🗑️ Deleted: {removed['question']}")
         return
 
     # /viewinfo
     if text == "/viewinfo":
         if not is_admin(uid): return
-        faq   = load_faq()
+        faq   = await jsonbin_read()
         info  = faq.get("channel_info", "(none set)")
         pairs = faq.get("qa_pairs", [])
         await tg_send(chat_id, f"📄 *Channel Info:*\n{info}\n\n📋 *Q&A Pairs:* {len(pairs)} total")
@@ -340,14 +323,15 @@ async def handle(data: dict) -> None:
     # /clearall
     if text == "/clearall":
         if not is_admin(uid): return
-        clear_all_faq()
-        await tg_send(chat_id, "🗑️ All data cleared from database.")
+        await jsonbin_write(DEFAULT_FAQ.copy())
+        await tg_send(chat_id, "🗑️ All data cleared.")
         return
 
     # Any message → full AI answer
     if not text.startswith("/"):
         await tg_action(chat_id)
-        answer = await ask_ai(text, load_faq())
+        faq    = await jsonbin_read()
+        answer = await ask_ai(text, faq)
         await tg_send(chat_id, f"🤖 {answer}")
 
         notify = (
@@ -391,14 +375,12 @@ def main():
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
         "RENDER_URL":         RENDER_URL,
-        "DATABASE_URL":       DATABASE_URL,
+        "JSONBIN_KEY":        JSONBIN_KEY,
     }.items() if not v]
     if missing:
         raise ValueError(f"❌ Missing: {', '.join(missing)}")
     if not ADMIN_IDS:
         raise ValueError("❌ Set ADMIN_IDS!")
-
-    init_db()
 
     loop = asyncio.new_event_loop()
     loop.run_until_complete(tg_set_webhook(f"{RENDER_URL}/webhook"))

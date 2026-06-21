@@ -1,3 +1,2 @@
 flask
 httpx
-psycopg2-binary
