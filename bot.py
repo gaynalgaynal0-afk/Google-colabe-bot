@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Channel FAQ Bot — handles DMs + Groups + Channel Discussion
+Telegram Channel FAQ Bot — Uses OpenRouter (FREE)
 """
 
 import os
@@ -8,13 +8,12 @@ import json
 import logging
 import asyncio
 import httpx
-from google import genai
 from flask import Flask, request
 
 # ═══════════════════════════════════════════════════
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
-RENDER_URL         = os.environ.get("RENDER_URL", "").rstrip("/")
+TELEGRAM_BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+OPENROUTER_API_KEY  = os.environ.get("OPENROUTER_API_KEY", "")
+RENDER_URL          = os.environ.get("RENDER_URL", "").rstrip("/")
 ADMIN_IDS = [
     int(x.strip())
     for x in os.environ.get("ADMIN_IDS", "").split(",")
@@ -30,40 +29,36 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-flask_app     = Flask(__name__)
-gemini_client = None
+flask_app = Flask(__name__)
 
 
-# ── Telegram helpers ─────────────────────────────────────────────────────────
+# ── Telegram helpers ──────────────────────────────────────────────────────────
 
 async def tg_send(chat_id: int, text: str, parse_mode: str = "Markdown") -> None:
-    # Truncate to avoid Telegram 4096 char limit
     if len(text) > 4000:
         text = text[:4000] + "..."
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(f"{TG_API}/sendMessage", json={
-            "chat_id":    chat_id,
-            "text":       text,
+            "chat_id": chat_id,
+            "text": text,
             "parse_mode": parse_mode,
         })
         if r.status_code != 200:
             logger.error(f"tg_send failed: {r.text}")
 
-async def tg_action(chat_id: int, action: str = "typing") -> None:
+async def tg_action(chat_id: int) -> None:
     async with httpx.AsyncClient(timeout=10) as client:
         await client.post(f"{TG_API}/sendChatAction", json={
-            "chat_id": chat_id,
-            "action":  action,
+            "chat_id": chat_id, "action": "typing"
         })
 
 async def tg_set_webhook(url: str) -> None:
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(f"{TG_API}/setWebhook", json={
             "url": url,
-            "allowed_updates": ["message"],  # receive ALL message types
+            "allowed_updates": ["message"],
         })
-        logger.info(f"✅ Webhook set → {r.json()}")
+        logger.info(f"✅ Webhook → {r.json()}")
 
 
 # ── FAQ storage ───────────────────────────────────────────────────────────────
@@ -79,9 +74,9 @@ def save_faq(data: dict) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# ── Gemini AI ─────────────────────────────────────────────────────────────────
+# ── OpenRouter AI ─────────────────────────────────────────────────────────────
 
-def ask_gemini(question: str, faq_data: dict) -> str:
+async def ask_ai(question: str, faq_data: dict) -> str:
     channel_info = faq_data.get("channel_info", "")
     qa_pairs     = faq_data.get("qa_pairs", [])
 
@@ -100,26 +95,39 @@ def ask_gemini(question: str, faq_data: dict) -> str:
         for i, p in enumerate(qa_pairs, 1):
             knowledge += f"Q{i}: {p['question']}\nA{i}: {p['answer']}\n\n"
 
-    prompt = f"""You are a FAQ bot for a Telegram channel.
-Answer ONLY from the knowledge base. Do NOT use outside knowledge.
+    system = f"""You are a FAQ bot for a Telegram channel.
+Answer ONLY from the knowledge base below. Do NOT use outside knowledge.
 Reply in BOTH English AND Arabic (English first, then ───, then Arabic).
 Understand typos. Be concise and friendly.
+If the answer is not in the knowledge base, say politely you don't have that info.
 
 KNOWLEDGE BASE:
-{knowledge}
-
-QUESTION: {question}"""
+{knowledge}"""
 
     try:
-        resp = gemini_client.models.generate_content(
-            model="gemini-2.0-flash", contents=prompt
-        )
-        return resp.text
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "mistralai/mistral-7b-instruct:free",
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user",   "content": question},
+                    ],
+                    "max_tokens": 500,
+                },
+            )
+            data = r.json()
+            return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logger.error(f"Gemini error: {e}")
+        logger.error(f"AI error: {e}")
         return (
-            "❌ Could not generate answer right now. Admin has been notified.\n\n"
-            "❌ لم أتمكن من إنشاء إجابة الآن. تم إخطار المشرف."
+            "❌ Could not generate answer right now.\n\n"
+            "❌ لم أتمكن من إنشاء إجابة الآن."
         )
 
 
@@ -127,29 +135,25 @@ def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
 
-# ── Main update handler ───────────────────────────────────────────────────────
+# ── Update handler ────────────────────────────────────────────────────────────
 
 async def handle(data: dict) -> None:
-    logger.info(f"Update received: {json.dumps(data)[:300]}")
+    logger.info(f"Update: {json.dumps(data)[:200]}")
 
     msg = data.get("message")
-    if not msg:
-        logger.info("No message in update, skipping.")
+    if not msg or not msg.get("text"):
         return
 
-    text = msg.get("text", "").strip()
-    if not text:
-        return  # ignore stickers, photos, etc.
-
+    text      = msg["text"].strip()
     chat_id   = msg["chat"]["id"]
-    chat_type = msg["chat"].get("type", "private")  # private / group / supergroup
+    chat_type = msg["chat"].get("type", "private")
     user      = msg.get("from", {})
     uid       = user.get("id", 0)
     uname     = f"@{user['username']}" if user.get("username") else user.get("first_name", "User")
 
-    logger.info(f"Message from {uname} (uid={uid}) in {chat_type} (chat={chat_id}): {text}")
+    logger.info(f"{uname} in {chat_type}: {text}")
 
-    # ── /start ────────────────────────────────────────
+    # /start
     if text.startswith("/start"):
         if is_admin(uid):
             reply = (
@@ -177,10 +181,9 @@ async def handle(data: dict) -> None:
         await tg_send(chat_id, reply)
         return
 
-    # ── /answer (admin only) ──────────────────────────
+    # /answer
     if text.startswith("/answer"):
-        if not is_admin(uid):
-            return
+        if not is_admin(uid): return
         parts = text.split(None, 2)
         if len(parts) < 3 or not parts[1].lstrip("-").isdigit():
             await tg_send(chat_id, "Usage: `/answer USER_ID your reply`")
@@ -192,7 +195,7 @@ async def handle(data: dict) -> None:
             await tg_send(chat_id, f"❌ Failed: {e}")
         return
 
-    # ── /setinfo ──────────────────────────────────────
+    # /setinfo
     if text.startswith("/setinfo"):
         if not is_admin(uid): return
         info = text[8:].strip()
@@ -205,7 +208,7 @@ async def handle(data: dict) -> None:
         await tg_send(chat_id, f"✅ Channel info updated!\n\n{info}")
         return
 
-    # ── /addqa ────────────────────────────────────────
+    # /addqa
     if text.startswith("/addqa"):
         if not is_admin(uid): return
         body = text[6:].strip()
@@ -224,7 +227,7 @@ async def handle(data: dict) -> None:
         await tg_send(chat_id, f"✅ Q&A added!\n\n❓ {question}\n💬 {answer}")
         return
 
-    # ── /listqa ───────────────────────────────────────
+    # /listqa
     if text == "/listqa":
         if not is_admin(uid): return
         faq   = load_faq()
@@ -238,7 +241,7 @@ async def handle(data: dict) -> None:
         await tg_send(chat_id, "\n".join(lines))
         return
 
-    # ── /deleteqa ─────────────────────────────────────
+    # /deleteqa
     if text.startswith("/deleteqa"):
         if not is_admin(uid): return
         parts = text.split()
@@ -256,7 +259,7 @@ async def handle(data: dict) -> None:
         await tg_send(chat_id, f"🗑️ Deleted: {removed['question']}")
         return
 
-    # ── /viewinfo ─────────────────────────────────────
+    # /viewinfo
     if text == "/viewinfo":
         if not is_admin(uid): return
         faq   = load_faq()
@@ -265,17 +268,17 @@ async def handle(data: dict) -> None:
         await tg_send(chat_id, f"📄 *Channel Info:*\n{info}\n\n📋 *Q&A Pairs:* {len(pairs)} total")
         return
 
-    # ── /clearall ─────────────────────────────────────
+    # /clearall
     if text == "/clearall":
         if not is_admin(uid): return
         save_faq({"channel_info": "", "qa_pairs": []})
         await tg_send(chat_id, "🗑️ All data cleared.")
         return
 
-    # ── Regular question (DM or group) ────────────────
+    # Regular question
     if not text.startswith("/"):
-        await tg_action(chat_id, "typing")
-        answer = ask_gemini(text, load_faq())
+        await tg_action(chat_id)
+        answer = await ask_ai(text, load_faq())
         await tg_send(
             chat_id,
             f"🤖 *Answer:*\n\n{answer}\n\n"
@@ -283,23 +286,21 @@ async def handle(data: dict) -> None:
             "📌 Admin notified for a detailed answer.\n"
             "📌 تم إخطار المشرف لإجابة مفصلة.",
         )
-        # Notify admins
         notify = (
             f"📬 *New Question from {uname}*\n"
             f"🆔 User ID: `{chat_id}`\n"
-            f"💬 Chat type: `{chat_type}`\n\n"
+            f"💬 Chat: `{chat_type}`\n\n"
             f"❓ *Question:*\n{text}\n\n"
-            f"─────────────────────\n"
             f"Reply: `/answer {chat_id} your reply`"
         )
         for aid in ADMIN_IDS:
             try:
                 await tg_send(aid, notify)
             except Exception as e:
-                logger.error(f"Admin notify failed {aid}: {e}")
+                logger.error(f"Admin notify failed: {e}")
 
 
-# ── Flask routes ──────────────────────────────────────────────────────────────
+# ── Flask ─────────────────────────────────────────────────────────────────────
 
 @flask_app.route("/", methods=["GET"])
 def index():
@@ -322,19 +323,15 @@ def webhook():
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global gemini_client
-
     missing = [k for k, v in {
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-        "GEMINI_API_KEY":     GEMINI_API_KEY,
+        "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
         "RENDER_URL":         RENDER_URL,
     }.items() if not v]
     if missing:
-        raise ValueError(f"❌ Missing env vars: {', '.join(missing)}")
+        raise ValueError(f"❌ Missing: {', '.join(missing)}")
     if not ADMIN_IDS:
         raise ValueError("❌ Set ADMIN_IDS!")
-
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
     loop = asyncio.new_event_loop()
     loop.run_until_complete(tg_set_webhook(f"{RENDER_URL}/webhook"))
@@ -342,7 +339,6 @@ def main():
 
     logger.info(f"✅ Bot running on port {PORT}")
     flask_app.run(host="0.0.0.0", port=PORT)
-
 
 if __name__ == "__main__":
     main()
